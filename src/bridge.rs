@@ -5,14 +5,108 @@ use std::sync::{Arc, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::analytics::{self, PRIVACY_SETTING_PATH};
-use crate::audio_engine::AudioInputDeviceInfo;
-use crate::discord;
+use crate::stats::{self, PRIVACY_SETTING_PATH};
+use crate::audio::AudioInputDeviceInfo;
+use crate::integrations::discord;
 use crate::editor::{
     self, AudioStemMixConfig, AudioTrackRole, ClipMetadata, CutMode, EditJob, EditResult,
     ResolutionPreset, SplitResult, StemExportResult, VideoPreviewSession,
 };
-use crate::events::EventSink;
+use crate::stats::{
+    resolve_local_match_stats_path, LocalMatchStatsStore, MatchStatsRecord,
+    MonthlyStatsSummary,
+};
+use crate::tracker::EventSink;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalLauncherIdentity {
+    pub launcher: String,
+    pub display_id: String,
+    pub account_id: String,
+    pub region_or_tag: String,
+    pub online_status: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LiveGameStateSnapshot {
+    pub active_game: String,
+    pub phase: String,
+    pub map: String,
+    pub mode: String,
+    pub hero_or_agent: String,
+    pub weapon_or_loadout: String,
+    pub player_identity: String,
+    pub score_for: Option<i64>,
+    pub score_against: Option<i64>,
+    pub kills: u32,
+    pub deaths: u32,
+    pub assists: u32,
+    pub headshots: u32,
+    pub bodyshots: u32,
+    pub legshots: u32,
+    pub damage_dealt: u32,
+    pub combat_score: u32,
+    pub goals: u32,
+    pub saves: u32,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct YearWrappedSummary {
+    pub year: i32,
+    pub game_filter: String,
+    pub player_identity: String,
+    pub launcher_name: String,
+    pub total_matches: u32,
+    pub total_hours: f64,
+    pub wins: u32,
+    pub losses: u32,
+    pub win_rate_pct: f64,
+    pub total_kills: u32,
+    pub total_deaths: u32,
+    pub total_assists: u32,
+    pub kd_ratio: f64,
+    pub total_headshots: u32,
+    pub total_bodyshots: u32,
+    pub total_legshots: u32,
+    pub headshot_pct: f64,
+    pub bodyshot_pct: f64,
+    pub legshot_pct: f64,
+    pub total_damage: u32,
+    pub avg_combat_score: f64,
+    pub total_aces: u32,
+    pub total_clutches: u32,
+    pub total_multikills: u32,
+    pub total_mvps: u32,
+    pub total_goals: u32,
+    pub total_saves: u32,
+    pub total_shots: u32,
+    pub goal_conversion_pct: f64,
+    pub peak_kills_in_match: u32,
+    pub top_character_label: String,
+    pub top_character_name: String,
+    pub top_character_matches: u32,
+    pub top_character_win_rate: f64,
+    pub top_weapon_name: String,
+    pub favorite_map: String,
+    pub playstyle_title: String,
+    pub playstyle_subtitle: String,
+    pub available_games: Vec<String>,
+}
+
+pub fn role_column_label_for_game(game: &str) -> &'static str {
+    match game.trim().to_lowercase().as_str() {
+        "valorant" => "TOP AGENT",
+        "lol" | "league_of_legends" | "league of legends" => "TOP CHAMPION",
+        "dota2" | "dota 2" | "overwatch2" | "overwatch 2" | "marvel_rivals" | "marvel rivals" => "TOP HERO",
+        "apex_legends" | "apex legends" => "TOP LEGEND",
+        "rainbow_six_siege" | "rainbow six siege" => "TOP OPERATOR",
+        "cs2" | "counter-strike 2" => "PRIMARY SIDE / ROLE",
+        "rocket_league" | "rocket league" => "SIGNATURE CAR",
+        "fc26" | "fc27" | "efootball" | "ea sports fc" => "FAVORITE CLUB",
+        _ => "PRIMARY AGENT / HERO",
+    }
+}
 use crate::recorder::config::{
     parse_resolution_pair, AudioMode, Container, Fps, Keybind, KeybindsConfig, Quality,
     RecorderConfig, StorageMode,
@@ -112,7 +206,7 @@ impl AppSettings {
                 separate_audio_tracks: cfg.separate_audio_tracks,
             },
             keybinds: cfg.keybinds.clone(),
-            discord_rich_presence: discord::is_discord_rpc_enabled(),
+            discord_rich_presence: crate::integrations::discord::is_discord_rpc_enabled(),
             privacy: PrivacySettings {
                 setting_path: PRIVACY_SETTING_PATH.to_string(),
                 share_anonymous_stats: cfg.share_anonymous_stats,
@@ -253,6 +347,18 @@ impl UiBridge {
         editor::extract_frame_rgba(input_path, target_ms, dst_w, dst_h)
     }
 
+    pub fn save_frame_screenshot(
+        &self,
+        input_path: impl AsRef<Path>,
+        target_ms: u64,
+    ) -> Result<PathBuf, String> {
+        editor::save_frame_screenshot_png(input_path, target_ms, None)
+    }
+
+    pub fn copy_file_to_clipboard(&self, path: &Path) -> Result<(), String> {
+        editor::copy_file_to_clipboard(path)
+    }
+
     pub fn open_preview_session(
         &self,
         input_path: impl AsRef<Path>,
@@ -300,7 +406,7 @@ impl UiBridge {
         if let Ok(mut cfg) = self.config.write() {
             cfg.share_anonymous_stats = enabled;
         }
-        let saved_path = analytics::persist_share_anonymous_stats(enabled)?;
+        let saved_path = stats::persist_share_anonymous_stats(enabled)?;
         if let Some(ref s) = self.sink {
             s.emit(
                 "settings.privacy.share_anonymous_stats",
@@ -317,12 +423,12 @@ impl UiBridge {
     }
 
     pub fn discord_rpc_enabled(&self) -> bool {
-        discord::is_discord_rpc_enabled()
+        crate::integrations::discord::is_discord_rpc_enabled()
     }
 
     pub fn set_discord_rpc_enabled(&self, enabled: bool) -> Result<PathBuf, String> {
-        discord::set_discord_rpc_enabled(enabled);
-        let saved_path = discord::persist_discord_rpc_enabled(enabled)?;
+        crate::integrations::discord::set_discord_rpc_enabled(enabled);
+        let saved_path = crate::integrations::discord::persist_discord_rpc_enabled(enabled)?;
         if let Some(ref s) = self.sink {
             s.emit(
                 "settings.discord.rich_presence",
@@ -595,6 +701,92 @@ impl UiBridge {
             );
         }
         Ok(res)
+    }
+
+    pub fn splice_kept_segments(
+        &self,
+        input_path: impl AsRef<Path>,
+        segments_ms: &[(u64, u64)],
+        template_job: &EditJob,
+        output_path: Option<PathBuf>,
+    ) -> Result<EditResult, String> {
+        let res = editor::splice_kept_segments(input_path, segments_ms, template_job, output_path)?;
+        if let Some(ref s) = self.sink {
+            s.emit(
+                "editor.job_done",
+                None,
+                json!({
+                    "output_path": res.output_path.to_string_lossy(),
+                    "duration_ms": res.duration_ms,
+                }),
+            );
+        }
+        Ok(res)
+    }
+
+    pub fn query_local_stats_summary(
+        &self,
+        days: u32,
+        game_filter: Option<&str>,
+    ) -> MonthlyStatsSummary {
+        let store = LocalMatchStatsStore::load_or_default(resolve_local_match_stats_path());
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        store.summary_for_days_filtered(days, game_filter, now_ms)
+    }
+
+    pub fn query_year_wrapped(
+        &self,
+        year_filter: Option<i32>,
+        game_filter: Option<&str>,
+    ) -> YearWrappedSummary {
+        let store = LocalMatchStatsStore::load_or_default(resolve_local_match_stats_path());
+        let val = store.compute_year_wrapped_value(year_filter, game_filter);
+        serde_json::from_value(val).unwrap_or_default()
+    }
+
+    pub fn discover_local_identities(&self) -> Vec<LocalLauncherIdentity> {
+        let val = LocalMatchStatsStore::discover_local_identities_value();
+        serde_json::from_value(val).unwrap_or_default()
+    }
+
+    pub fn query_live_game_state(&self) -> Option<LiveGameStateSnapshot> {
+        let val = LocalMatchStatsStore::live_game_state_value();
+        serde_json::from_value(val).ok()
+    }
+
+    pub fn sync_game_files_now(&self) -> usize {
+        let mut store = LocalMatchStatsStore::load_or_default(resolve_local_match_stats_path());
+        let added = store.sync_historical_game_logs();
+        if added > 0 {
+            let _ = store.save_to_disk();
+        }
+        added
+    }
+
+    pub fn save_custom_match_stats(
+        &self,
+        record: MatchStatsRecord,
+    ) -> Result<MatchStatsRecord, String> {
+        let mut store = LocalMatchStatsStore::load_or_default(resolve_local_match_stats_path());
+        let saved = store.add_or_update_custom_match(record);
+        if let Some(ref s) = self.sink {
+            s.emit("stats.add_custom_match", None, json!({ "match_id": saved.match_id }));
+        }
+        Ok(saved)
+    }
+
+    pub fn delete_match_stats(&self, match_id: &str) -> Result<bool, String> {
+        let mut store = LocalMatchStatsStore::load_or_default(resolve_local_match_stats_path());
+        let deleted = store.delete_match(match_id);
+        if deleted {
+            if let Some(ref s) = self.sink {
+                s.emit("stats.delete_match", None, json!({ "match_id": match_id }));
+            }
+        }
+        Ok(deleted)
     }
 
     pub fn rescale_clip(

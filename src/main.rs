@@ -4,15 +4,17 @@ use std::path::{Path, PathBuf};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-mod achievements;
-mod analytics;
-mod bridge;
-mod discord;
-mod events;
-pub mod audio_engine;
+pub mod audio;
+pub mod bridge;
+pub mod clips;
+pub mod core;
 pub mod editor;
+pub mod games;
 pub mod gui;
+pub mod integrations;
 pub mod recorder;
+pub mod stats;
+pub mod tracker;
 
 use recorder::{
     list_input_devices, make_it_for_discord, parse_duration_secs, parse_resolution_pair,
@@ -298,7 +300,7 @@ fn parse_cli_args() -> Result<Option<CliArgs>, String> {
             }
             "--no-telemetry" | "--disable-telemetry" => {
                 telemetry_enabled = Some(false);
-                let _ = analytics::persist_share_anonymous_stats(false);
+                let _ = stats::persist_share_anonymous_stats(false);
             }
             "--share-anonymous-stats" | "--privacy-share-anonymous-stats" => {
                 let raw = match inline_val {
@@ -312,7 +314,7 @@ fn parse_cli_args() -> Result<Option<CliArgs>, String> {
                     "0" | "false" | "no" | "off" | "disabled"
                 );
                 telemetry_enabled = Some(en);
-                let _ = analytics::persist_share_anonymous_stats(en);
+                let _ = stats::persist_share_anonymous_stats(en);
             }
             "--regenerate-token" | "--new-token" => {
                 regenerate_token = true;
@@ -385,7 +387,7 @@ fn parse_cli_args() -> Result<Option<CliArgs>, String> {
 }
 
 fn load_config_low_end_override() -> Option<bool> {
-    let cfg_path = discord::locate_config_file()?;
+    let cfg_path = crate::integrations::discord::locate_config_file()?;
     let content = std::fs::read_to_string(cfg_path).ok()?;
     for line in content.lines() {
         let trimmed = line.trim();
@@ -404,7 +406,7 @@ fn load_config_low_end_override() -> Option<bool> {
 }
 
 fn load_or_generate_gsi_token(force_regenerate: bool) -> String {
-    let config_path = discord::locate_config_file()
+    let config_path = crate::integrations::discord::locate_config_file()
         .unwrap_or_else(|| PathBuf::from("clotch_config.toml"));
     let mut existing_lines: Vec<String> = Vec::new();
     if config_path.exists() {
@@ -451,18 +453,18 @@ fn load_or_generate_gsi_token(force_regenerate: bool) -> String {
 }
 
 fn auto_install_game_integrations(token: &str) {
-    if let Some(cs2_cfg) = events::locate_cs2_cfg_dir() {
-        let gsi = events::GsiSource::new(events::presets::CS2_GSI_PORT, token);
+    if let Some(cs2_cfg) = games::locate_cs2_cfg_dir() {
+        let gsi = games::GsiSource::new(games::CS2_GSI_PORT, token);
         match gsi.install(&cs2_cfg) {
             Ok(p) => println!("[CONFIG] CS2 Gamestate Integration installed: {}", p.display()),
             Err(e) => eprintln!("[CONFIG WARN] CS2 GSI configuration could not be written: {e}"),
         }
     }
 
-    if let Some(dota2_cfg) = events::locate_dota2_cfg_dir() {
+    if let Some(dota2_cfg) = games::locate_dota2_cfg_dir() {
         let cfg_body = format!(
             "\"Dota 2 Integration Configuration\"\n{{\n    \"uri\" \"http://127.0.0.1:{}/gsi\"\n    \"timeout\" \"5.0\"\n    \"buffer\" \"0.1\"\n    \"throttle\" \"0.1\"\n    \"heartbeat\" \"30.0\"\n    \"data\"\n    {{\n        \"provider\" \"1\"\n        \"map\" \"1\"\n        \"player\" \"1\"\n        \"hero\" \"1\"\n        \"abilities\" \"1\"\n        \"items\" \"1\"\n    }}\n    \"auth\"\n    {{\n        \"token\" \"{}\"\n    }}\n}}\n",
-            events::presets::DOTA2_GSI_PORT,
+            games::DOTA2_GSI_PORT,
             token
         );
         let path = dota2_cfg.join("gamestate_integration_clotch.cfg");
@@ -482,10 +484,10 @@ fn auto_install_game_integrations(token: &str) {
         }
     }
 
-    if let Some(rl_cfg) = events::locate_rocket_league_config_dir() {
-        match events::enable_rocket_league_stats_api(
+    if let Some(rl_cfg) = games::locate_rocket_league_config_dir() {
+        match games::enable_rocket_league_stats_api(
             &rl_cfg,
-            events::presets::ROCKET_LEAGUE_PORT,
+            games::ROCKET_LEAGUE_PORT,
             10,
         ) {
             Ok(p) => println!(
@@ -498,8 +500,8 @@ fn auto_install_game_integrations(token: &str) {
         }
     }
 
-    if let Some(apex_dir) = events::locate_apex_cfg_dir() {
-        match events::install_apex_liveapi_config(&apex_dir, events::APEX_LIVEAPI_PORT) {
+    if let Some(apex_dir) = games::locate_apex_cfg_dir() {
+        match games::install_apex_liveapi_config(&apex_dir, games::APEX_LIVEAPI_PORT) {
             Ok(p) => println!(
                 "[CONFIG] Apex Legends LiveAPI telemetry configured: {}",
                 p.display()
@@ -513,9 +515,9 @@ fn auto_install_game_integrations(token: &str) {
 
 #[cfg(windows)]
 fn spawn_hotkey_listener(
-    hotkey_sink: events::EventSink,
+    hotkey_sink: tracker::EventSink,
     shared_config: std::sync::Arc<std::sync::RwLock<RecorderConfig>>,
-    mut event_rx: tokio::sync::broadcast::Receiver<events::Event>,
+    mut event_rx: tokio::sync::broadcast::Receiver<tracker::Event>,
     cancel: CancellationToken,
 ) -> std::thread::JoinHandle<()> {
     let rt_handle = tokio::runtime::Handle::try_current().ok();
@@ -738,9 +740,9 @@ fn spawn_hotkey_listener(
 
 #[cfg(not(windows))]
 fn spawn_hotkey_listener(
-    _hotkey_sink: events::EventSink,
+    _hotkey_sink: tracker::EventSink,
     _shared_config: std::sync::Arc<std::sync::RwLock<RecorderConfig>>,
-    _event_rx: tokio::sync::broadcast::Receiver<events::Event>,
+    _event_rx: tokio::sync::broadcast::Receiver<tracker::Event>,
     _cancel: CancellationToken,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(|| {})
@@ -874,7 +876,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         println!("========================================================================");
         println!(" Clotch Multi-Game Telemetry & Highlight Self-Test Suite (17 Games)");
         println!("========================================================================");
-        match events::run_all_games_self_test() {
+        match games::run_all_games_self_test() {
             Ok(results) => {
                 for (idx, (game_name, kinds)) in results.iter().enumerate() {
                     println!(
@@ -987,7 +989,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let gsi_token = load_or_generate_gsi_token(args.regenerate_token);
     auto_install_game_integrations(&gsi_token);
 
-    let mut reader = events::presets::all(&gsi_token)?;
+    let mut reader = games::all(&gsi_token)?;
     if effective_low_end {
         reader.scan_interval(std::time::Duration::from_secs(3));
     }
@@ -1089,21 +1091,21 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     let analytics_rx = reader.subscribe();
-    let analytics_handle = analytics::start_analytics_with_config(
+    let analytics_handle = stats::start_analytics_with_config(
         analytics_rx,
         &recorder_config,
         args.telemetry_enabled,
     );
     recorder_config.share_anonymous_stats = analytics_handle.share_anonymous_stats();
 
-    let mut discord_cfg = discord::DiscordConfig::from_env_and_file();
+    let mut discord_cfg = integrations::discord::DiscordConfig::from_env_and_file();
     if let Some(ref custom_id) = args.discord_app_id {
         if !custom_id.trim().is_empty() {
             discord_cfg.app_id = custom_id.trim().to_string();
         }
     }
     let discord_rx = reader.subscribe();
-    let discord_handle = discord::start_discord_presence(discord_rx, discord_cfg);
+    let discord_handle = integrations::discord::start_discord_presence(discord_rx, discord_cfg);
 
     let recorder_rx = reader.subscribe();
     let recorder_sink = reader.sink("system", "engine");
