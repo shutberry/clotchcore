@@ -459,26 +459,51 @@ fn convert_yuv_to_rgba_scaled(
     let y_plane = yuv.y();
     let u_plane = yuv.u();
     let v_plane = yuv.v();
-    let dw = dst_w as usize;
-    let dh = dst_h as usize;
+    let dw = dst_w.max(1) as usize;
+    let dh = dst_h.max(1) as usize;
+    let sw_max = src_w.saturating_sub(1);
+    let sh_max = src_h.saturating_sub(1);
+    let uv_w_max = (src_w / 2).saturating_sub(1);
+    let uv_h_max = (src_h / 2).saturating_sub(1);
+
     for dy in 0..dh {
-        let sy = (dy * src_h) / dh.max(1);
-        let sy_uv = (sy / 2).min((src_h / 2).saturating_sub(1));
-        let y_row = sy * ys;
+        let sy_fp = (dy * src_h * 256) / dh;
+        let sy0 = (sy_fp >> 8).min(sh_max);
+        let sy1 = (sy0 + 1).min(sh_max);
+        let wy = (sy_fp & 0xFF) as i32;
+        let inv_wy = 256 - wy;
+
+        let sy_uv = (sy0 / 2).min(uv_h_max);
+        let y_row0 = sy0 * ys;
+        let y_row1 = sy1 * ys;
         let u_row = sy_uv * us;
         let v_row = sy_uv * vs;
+
         for dx in 0..dw {
-            let sx = (dx * src_w) / dw.max(1);
-            let sx_uv = (sx / 2).min((src_w / 2).saturating_sub(1));
-            let y_val = y_plane.get(y_row + sx).copied().unwrap_or(16) as i32;
+            let sx_fp = (dx * src_w * 256) / dw;
+            let sx0 = (sx_fp >> 8).min(sw_max);
+            let sx1 = (sx0 + 1).min(sw_max);
+            let wx = (sx_fp & 0xFF) as i32;
+            let inv_wx = 256 - wx;
+
+            let y00 = y_plane.get(y_row0 + sx0).copied().unwrap_or(16) as i32;
+            let y01 = y_plane.get(y_row0 + sx1).copied().unwrap_or(y00 as u8) as i32;
+            let y10 = y_plane.get(y_row1 + sx0).copied().unwrap_or(y00 as u8) as i32;
+            let y11 = y_plane.get(y_row1 + sx1).copied().unwrap_or(y00 as u8) as i32;
+            let y_top = (y00 * inv_wx + y01 * wx) >> 8;
+            let y_bot = (y10 * inv_wx + y11 * wx) >> 8;
+            let y_val = (y_top * inv_wy + y_bot * wy) >> 8;
+
+            let sx_uv = (sx0 / 2).min(uv_w_max);
             let u_val = u_plane.get(u_row + sx_uv).copied().unwrap_or(128) as i32;
             let v_val = v_plane.get(v_row + sx_uv).copied().unwrap_or(128) as i32;
+
             let c = (y_val - 16).max(0);
             let d = u_val - 128;
             let e = v_val - 128;
-            let r = ((298 * c + 409 * e + 128) >> 8).clamp(0, 255) as u8;
-            let g = ((298 * c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8;
-            let b = ((298 * c + 516 * d + 128) >> 8).clamp(0, 255) as u8;
+            let r = ((298 * c + 459 * e + 128) >> 8).clamp(0, 255) as u8;
+            let g = ((298 * c - 55 * d - 136 * e + 128) >> 8).clamp(0, 255) as u8;
+            let b = ((298 * c + 541 * d + 128) >> 8).clamp(0, 255) as u8;
             let out_off = (dy * dw + dx) * 4;
             if out_off + 3 < rgba_out.len() {
                 rgba_out[out_off] = r;
@@ -487,6 +512,398 @@ fn convert_yuv_to_rgba_scaled(
                 rgba_out[out_off + 3] = 255;
             }
         }
+    }
+}
+
+#[cfg(windows)]
+struct PreviewAudioPlayer {
+    active_mix: Arc<Mutex<AudioStemMixConfig>>,
+    target_seek_ms: Arc< std::sync::atomic::AtomicU64>,
+    playing_flag: Arc<std::sync::atomic::AtomicBool>,
+    stop_flag: Arc<std::sync::atomic::AtomicBool>,
+    last_video_poll: Arc<Mutex<Instant>>,
+    thread_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+impl PreviewAudioPlayer {
+    fn spawn(audio_tracks: Vec<(AudioTrackMetadata, Vec<Arc<CompressedPacket>>)>) -> Option<Self> {
+        if audio_tracks.is_empty() || audio_tracks[0].1.is_empty() {
+            return None;
+        }
+        let active_mix = Arc::new(Mutex::new(AudioStemMixConfig::default()));
+        let target_seek_ms = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let playing_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let last_video_poll = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(5)));
+
+        let mix_c = active_mix.clone();
+        let seek_c = target_seek_ms.clone();
+        let play_c = playing_flag.clone();
+        let stop_c = stop_flag.clone();
+        let poll_c = last_video_poll.clone();
+
+        let handle = std::thread::Builder::new()
+            .name("clotch-preview-audio".into())
+            .spawn(move || {
+                run_preview_audio_thread(audio_tracks, mix_c, seek_c, play_c, stop_c, poll_c);
+            })
+            .ok();
+
+        Some(Self {
+            active_mix,
+            target_seek_ms,
+            playing_flag,
+            stop_flag,
+            last_video_poll,
+            thread_handle: handle,
+        })
+    }
+
+    fn notify_video_playhead(&self, target_ms: u64) {
+        if let Ok(mut g) = self.last_video_poll.lock() {
+            let elapsed = g.elapsed();
+            *g = Instant::now();
+            if elapsed <= Duration::from_millis(95) {
+                self.playing_flag.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let prev = self.target_seek_ms.swap(target_ms, std::sync::atomic::Ordering::AcqRel);
+        let _ = prev;
+    }
+
+    fn set_mix(&self, mix: AudioStemMixConfig) {
+        if let Ok(mut g) = self.active_mix.lock() {
+            *g = mix;
+        }
+    }
+
+    fn set_playing(&self, playing: bool) {
+        self.playing_flag.store(playing, std::sync::atomic::Ordering::Release);
+        if playing {
+            if let Ok(mut g) = self.last_video_poll.lock() {
+                *g = Instant::now();
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PreviewAudioPlayer {
+    fn drop(&mut self) {
+        self.stop_flag.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(h) = self.thread_handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+#[cfg(windows)]
+fn decode_aac_packets_via_mft(packets: &[Arc<CompressedPacket>]) -> Vec<(f32, f32)> {
+    use std::mem::ManuallyDrop;
+    use windows::core::GUID;
+    use windows::Win32::Media::MediaFoundation::{
+        IMFMediaBuffer, IMFMediaType, IMFSample, IMFTransform, MFCreateMediaType,
+        MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Audio, MFT_MESSAGE_COMMAND_FLUSH,
+        MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
+        MFT_OUTPUT_DATA_BUFFER, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
+        MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_BLOCK_ALIGNMENT, MF_MT_AUDIO_NUM_CHANNELS,
+        MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_MT_USER_DATA,
+    };
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+
+    const CLSID_CMS_AAC_DEC_MFT: GUID = GUID::from_u128(0x32d186a7_218f_4c75_8876_dd77273a8999);
+    const MF_AUDIO_FORMAT_AAC_GUID: GUID = GUID::from_u128(0x00001610_0000_0010_8000_00aa00389b71);
+    const MF_AUDIO_FORMAT_FLOAT_GUID: GUID = GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
+    const MF_MT_AAC_PAYLOAD_TYPE_GUID: GUID = GUID::from_u128(0xbfbab799_c9df_4c10_8935_07228f43a8ef);
+
+    let _ = crate::recorder::ensure_mf_initialized();
+    let mut pcm_out = Vec::with_capacity(packets.len() * 1024);
+
+    unsafe {
+        let Ok(mft) = CoCreateInstance::<_, IMFTransform>(&CLSID_CMS_AAC_DEC_MFT, None, CLSCTX_INPROC_SERVER) else {
+            return pcm_out;
+        };
+        let Ok(in_type) = MFCreateMediaType() else {
+            return pcm_out;
+        };
+        let _ = in_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio);
+        let _ = in_type.SetGUID(&MF_MT_SUBTYPE, &MF_AUDIO_FORMAT_AAC_GUID);
+        let _ = in_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, 48_000);
+        let _ = in_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2);
+        let _ = in_type.SetUINT32(&MF_MT_AAC_PAYLOAD_TYPE_GUID, 0);
+        let user_data: [u8; 14] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x90];
+        let _ = in_type.SetBlob(&MF_MT_USER_DATA, &user_data);
+
+        if mft.SetInputType(0, &in_type, 0).is_err() {
+            return pcm_out;
+        }
+
+        let mut out_configured = false;
+        for idx in 0..16 {
+            let Ok(avail) = mft.GetOutputAvailableType(0, idx) else {
+                break;
+            };
+            if avail.GetGUID(&MF_MT_SUBTYPE) == Ok(MF_AUDIO_FORMAT_FLOAT_GUID) {
+                if mft.SetOutputType(0, &avail, 0).is_ok() {
+                    out_configured = true;
+                    break;
+                }
+            }
+        }
+        if !out_configured {
+            if let Ok(out_type) = MFCreateMediaType() {
+                let _ = out_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio);
+                let _ = out_type.SetGUID(&MF_MT_SUBTYPE, &MF_AUDIO_FORMAT_FLOAT_GUID);
+                let _ = out_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, 48_000);
+                let _ = out_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2);
+                let _ = out_type.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 32);
+                let _ = out_type.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 8);
+                if mft.SetOutputType(0, &out_type, 0).is_ok() {
+                    out_configured = true;
+                }
+            }
+        }
+        if !out_configured {
+            return pcm_out;
+        }
+
+        let _ = mft.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+        let _ = mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+        let _ = mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+
+        let Ok(out_sample) = MFCreateSample() else {
+            return pcm_out;
+        };
+        let Ok(out_buf) = MFCreateMemoryBuffer(32768) else {
+            return pcm_out;
+        };
+        let _ = out_sample.AddBuffer(&out_buf);
+
+        for pkt in packets {
+            if pkt.data.is_empty() {
+                continue;
+            }
+            let Ok(in_s) = MFCreateSample() else {
+                continue;
+            };
+            let Ok(in_b) = MFCreateMemoryBuffer(pkt.data.len() as u32) else {
+                continue;
+            };
+            let mut ptr: *mut u8 = std::ptr::null_mut();
+            if in_b.Lock(&mut ptr, None, None).is_ok() {
+                if !ptr.is_null() {
+                    std::ptr::copy_nonoverlapping(pkt.data.as_ptr(), ptr, pkt.data.len());
+                    let _ = in_b.SetCurrentLength(pkt.data.len() as u32);
+                }
+                let _ = in_b.Unlock();
+            }
+            let _ = in_s.AddBuffer(&in_b);
+            let _ = mft.ProcessInput(0, &in_s, 0);
+
+            loop {
+                let _ = out_buf.SetCurrentLength(0);
+                let _ = out_sample.RemoveAllBuffers();
+                let _ = out_sample.AddBuffer(&out_buf);
+                let mut out_data = [MFT_OUTPUT_DATA_BUFFER {
+                    dwStreamID: 0,
+                    pSample: ManuallyDrop::new(Some(out_sample.clone())),
+                    dwStatus: 0,
+                    pEvents: ManuallyDrop::new(None),
+                }];
+                let mut status = 0u32;
+                let hr = mft.ProcessOutput(0, &mut out_data, &mut status);
+                let _ = ManuallyDrop::take(&mut out_data[0].pEvents);
+                let prod = ManuallyDrop::take(&mut out_data[0].pSample);
+                match hr {
+                    Ok(()) => {
+                        if let Some(s) = prod {
+                            if let Ok(mb) = s.ConvertToContiguousBuffer() {
+                                let mut rptr: *mut u8 = std::ptr::null_mut();
+                                let mut clen = 0u32;
+                                if mb.Lock(&mut rptr, None, Some(&mut clen)).is_ok() {
+                                    if !rptr.is_null() && clen >= 8 {
+                                        let f_slice = std::slice::from_raw_parts(
+                                            rptr as *const f32,
+                                            (clen as usize) / 4,
+                                        );
+                                        for pair in f_slice.chunks_exact(2) {
+                                            let l = if pair[0].is_finite() { pair[0] } else { 0.0 };
+                                            let r = if pair[1].is_finite() { pair[1] } else { 0.0 };
+                                            pcm_out.push((l, r));
+                                        }
+                                    }
+                                    let _ = mb.Unlock();
+                                }
+                            }
+                        }
+                    }
+                    Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                        if let Ok(avail) = mft.GetOutputAvailableType(0, 0) {
+                            let _ = mft.SetOutputType(0, &avail, 0);
+                        }
+                    }
+                    Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => break,
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+    pcm_out
+}
+
+#[cfg(windows)]
+fn run_preview_audio_thread(
+    audio_tracks: Vec<(AudioTrackMetadata, Vec<Arc<CompressedPacket>>)>,
+    active_mix: Arc<Mutex<AudioStemMixConfig>>,
+    target_seek_ms: Arc<std::sync::atomic::AtomicU64>,
+    playing_flag: Arc<std::sync::atomic::AtomicBool>,
+    stop_flag: Arc<std::sync::atomic::AtomicBool>,
+    last_video_poll: Arc<Mutex<Instant>>,
+) {
+    use windows::Win32::Media::Audio::{
+        eConsole, eRender, IAudioClient, IAudioRenderClient, IMMDeviceEnumerator,
+        MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, WAVEFORMATEX,
+    };
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
+    };
+
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+
+    let master_pcm = decode_aac_packets_via_mft(&audio_tracks[0].1);
+    if master_pcm.is_empty() {
+        return;
+    }
+    let has_stems = audio_tracks.len() >= 5;
+    let game_pcm = if has_stems { decode_aac_packets_via_mft(&audio_tracks[1].1) } else { Vec::new() };
+    let discord_pcm = if has_stems { decode_aac_packets_via_mft(&audio_tracks[2].1) } else { Vec::new() };
+    let mic_pcm = if has_stems { decode_aac_packets_via_mft(&audio_tracks[3].1) } else { Vec::new() };
+    let other_pcm = if has_stems { decode_aac_packets_via_mft(&audio_tracks[4].1) } else { Vec::new() };
+
+    unsafe {
+        let Ok(enumerator) = CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL) else {
+            return;
+        };
+        let Ok(device) = enumerator.GetDefaultAudioEndpoint(eRender, eConsole) else {
+            return;
+        };
+        let Ok(client) = device.Activate::<IAudioClient>(CLSCTX_ALL, None) else {
+            return;
+        };
+        let wf = WAVEFORMATEX {
+            wFormatTag: 3,
+            nChannels: 2,
+            nSamplesPerSec: 48_000,
+            nAvgBytesPerSec: 48_000 * 8,
+            nBlockAlign: 8,
+            wBitsPerSample: 32,
+            cbSize: 0,
+        };
+        if client
+            .Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                0x8000_0000 | 0x0800_0000,
+                1_000_000,
+                0,
+                &wf,
+                None,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let Ok(buf_frames) = client.GetBufferSize() else {
+            return;
+        };
+        let Ok(render) = client.GetService::<IAudioRenderClient>() else {
+            return;
+        };
+        let _ = client.Start();
+
+        let mut cursor_sample: usize = 0;
+        let mut last_target_ms: u64 = 0;
+
+        while !stop_flag.load(std::sync::atomic::Ordering::Acquire) {
+            let poll_stale = last_video_poll
+                .lock()
+                .map(|t| t.elapsed() > Duration::from_millis(140))
+                .unwrap_or(true);
+            let is_playing = playing_flag.load(std::sync::atomic::Ordering::Acquire) && !poll_stale;
+
+            let req_ms = target_seek_ms.load(std::sync::atomic::Ordering::Acquire);
+            if req_ms != u64::MAX {
+                let target_sample = ((req_ms as usize) * 48).min(master_pcm.len());
+                let diff = (target_sample as isize - cursor_sample as isize).abs();
+                if diff > 4800 || req_ms != last_target_ms {
+                    if diff > 3600 {
+                        cursor_sample = target_sample;
+                    }
+                    last_target_ms = req_ms;
+                }
+            }
+
+            if !is_playing || cursor_sample >= master_pcm.len() {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+
+            if let Ok(padding) = client.GetCurrentPadding() {
+                let avail = buf_frames.saturating_sub(padding) as usize;
+                let to_write = avail.min(960);
+                if to_write > 0 {
+                    let mix_cfg = active_mix
+                        .lock()
+                        .map(|g| g.clone())
+                        .unwrap_or_default();
+                    if let Ok(buf_ptr) = render.GetBuffer(to_write as u32) {
+                        let out_slice = std::slice::from_raw_parts_mut(buf_ptr as *mut f32, to_write * 2);
+                        for i in 0..to_write {
+                            let idx = cursor_sample + i;
+                            let (l, r) = if mix_cfg.is_all_muted() || idx >= master_pcm.len() {
+                                (0.0f32, 0.0f32)
+                            } else if has_stems && !mix_cfg.is_unmodified_full_mix() {
+                                let (gl, gr) = if mix_cfg.game_enabled {
+                                    let s = game_pcm.get(idx).copied().unwrap_or((0.0, 0.0));
+                                    (s.0 * mix_cfg.game_gain, s.1 * mix_cfg.game_gain)
+                                } else {
+                                    (0.0, 0.0)
+                                };
+                                let (dl, dr) = if mix_cfg.discord_enabled {
+                                    let s = discord_pcm.get(idx).copied().unwrap_or((0.0, 0.0));
+                                    (s.0 * mix_cfg.discord_gain, s.1 * mix_cfg.discord_gain)
+                                } else {
+                                    (0.0, 0.0)
+                                };
+                                let (ml, mr) = if mix_cfg.mic_enabled {
+                                    let s = mic_pcm.get(idx).copied().unwrap_or((0.0, 0.0));
+                                    (s.0 * mix_cfg.mic_gain, s.1 * mix_cfg.mic_gain)
+                                } else {
+                                    (0.0, 0.0)
+                                };
+                                let (ol, or_) = if mix_cfg.other_enabled {
+                                    let s = other_pcm.get(idx).copied().unwrap_or((0.0, 0.0));
+                                    (s.0 * mix_cfg.other_gain, s.1 * mix_cfg.other_gain)
+                                } else {
+                                    (0.0, 0.0)
+                                };
+                                ((gl + dl + ml + ol).clamp(-1.0, 1.0), (gr + dr + mr + or_).clamp(-1.0, 1.0))
+                            } else {
+                                master_pcm.get(idx).copied().unwrap_or((0.0, 0.0))
+                            };
+                            out_slice[i * 2] = l;
+                            out_slice[i * 2 + 1] = r;
+                        }
+                        let _ = render.ReleaseBuffer(to_write as u32, 0);
+                        cursor_sample = (cursor_sample + to_write).min(master_pcm.len());
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(6));
+        }
+        let _ = client.Stop();
     }
 }
 
@@ -502,6 +919,8 @@ pub struct VideoPreviewSession {
     cached_w: u32,
     cached_h: u32,
     cached_pts_ms: u64,
+    #[cfg(windows)]
+    audio_player: Option<PreviewAudioPlayer>,
 }
 
 impl VideoPreviewSession {
@@ -512,6 +931,8 @@ impl VideoPreviewSession {
         }
         let sw_dec = OpenH264Decoder::new()
             .map_err(|e| format!("OpenH264 decoder init failed: {e}"))?;
+        #[cfg(windows)]
+        let audio_player = PreviewAudioPlayer::spawn(demuxed.audio_tracks_packets);
         Ok(Self {
             metadata: demuxed.metadata,
             sps: demuxed.sps,
@@ -524,11 +945,31 @@ impl VideoPreviewSession {
             cached_w: 0,
             cached_h: 0,
             cached_pts_ms: 0,
+            #[cfg(windows)]
+            audio_player,
         })
     }
 
     pub fn metadata(&self) -> &ClipMetadata {
         &self.metadata
+    }
+
+    pub fn set_preview_audio_mix(&self, mix: AudioStemMixConfig) {
+        #[cfg(windows)]
+        if let Some(ref ap) = self.audio_player {
+            ap.set_mix(mix);
+        }
+        #[cfg(not(windows))]
+        let _ = mix;
+    }
+
+    pub fn set_preview_playing(&self, playing: bool) {
+        #[cfg(windows)]
+        if let Some(ref ap) = self.audio_player {
+            ap.set_playing(playing);
+        }
+        #[cfg(not(windows))]
+        let _ = playing;
     }
 
     pub fn decode_frame_rgba(
@@ -537,6 +978,10 @@ impl VideoPreviewSession {
         dst_w: u32,
         dst_h: u32,
     ) -> Result<(u64, Vec<u8>), String> {
+        #[cfg(windows)]
+        if let Some(ref ap) = self.audio_player {
+            ap.notify_video_playhead(target_ms);
+        }
         if self.video_packets.is_empty() {
             return Err("clip contains no video packets".to_string());
         }
@@ -689,37 +1134,8 @@ pub fn extract_frame_rgba(
             continue;
         }
         if let Ok(Some(yuv)) = sw_dec.decode(&annex_b_buf) {
-            let (src_w, src_h) = yuv.dimensions();
-            let (ys, us, vs) = yuv.strides();
-            let y_plane = yuv.y();
-            let u_plane = yuv.u();
-            let v_plane = yuv.v();
-            let dw = dst_w as usize;
-            let dh = dst_h as usize;
-            for dy in 0..dh {
-                let sy = (dy * src_h) / dh.max(1);
-                let sy_uv = (sy / 2).min((src_h / 2).saturating_sub(1));
-                let y_row = sy * ys;
-                let u_row = sy_uv * us;
-                let v_row = sy_uv * vs;
-                for dx in 0..dw {
-                    let sx = (dx * src_w) / dw.max(1);
-                    let sx_uv = (sx / 2).min((src_w / 2).saturating_sub(1));
-                    let y_val = y_plane.get(y_row + sx).copied().unwrap_or(16) as i32;
-                    let u_val = u_plane.get(u_row + sx_uv).copied().unwrap_or(128) as i32;
-                    let v_val = v_plane.get(v_row + sx_uv).copied().unwrap_or(128) as i32;
-                    let c = (y_val - 16).max(0);
-                    let d = u_val - 128;
-                    let e = v_val - 128;
-                    let r = ((298 * c + 409 * e + 128) >> 8).clamp(0, 255) as u8;
-                    let g = ((298 * c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8;
-                    let b = ((298 * c + 516 * d + 128) >> 8).clamp(0, 255) as u8;
-                    let out_off = (dy * dw + dx) * 4;
-                    rgba_out[out_off] = r;
-                    rgba_out[out_off + 1] = g;
-                    rgba_out[out_off + 2] = b;
-                    rgba_out[out_off + 3] = 255;
-                }
+            if pkt.pts_ms >= target_ms || !decoded_any {
+                convert_yuv_to_rgba_scaled(&yuv, dst_w, dst_h, &mut rgba_out);
             }
             decoded_any = true;
             if pkt.pts_ms >= target_ms {
@@ -1772,16 +2188,20 @@ fn demux_mp4_full(input_path: &Path, logical_path: Option<&Path>) -> Result<Demu
             if let Ok(Some(s)) = mp4.read_sample(v_id, sample_idx) {
                 let pts_ms = (s.start_time.saturating_mul(1000)) / (v_timescale as u64);
                 let dur_ms = ((s.duration as u64).saturating_mul(1000) / (v_timescale as u64)).max(1);
-                let render_off_ms =
-                    ((s.rendering_offset as i64) * 1000) / (v_timescale as i64).max(1);
+                let ticks_90k = if v_timescale == 90_000 {
+                    (s.start_time as i64).saturating_add(s.rendering_offset as i64)
+                } else {
+                    (((s.start_time as i128 + s.rendering_offset as i128) * 90_000)
+                        / (v_timescale as i128)) as i64
+                };
                 if s.is_sync {
                     keyframe_timestamps_ms.push(pts_ms);
                 }
                 video_packets.push(Arc::new(CompressedPacket {
                     kind: PacketKind::Video,
                     pts_ms,
-                    pts: (pts_ms as i64).saturating_add(render_off_ms),
-                    dts: pts_ms as i64,
+                    pts: ticks_90k.max(0),
+                    dts: ticks_90k.max(0),
                     duration: dur_ms as i64,
                     is_keyframe: s.is_sync,
                     data: s.bytes,
@@ -2024,6 +2444,102 @@ fn build_remixed_audio_packets(
             }
 
             if !mix.is_unmodified_full_mix() {
+                #[cfg(windows)]
+                {
+                    let master_pkts = &demuxed.audio_tracks_packets[0].1;
+                    let game_pcm = if mix.game_enabled && mix.game_gain > 0.001 {
+                        decode_aac_packets_via_mft(&demuxed.audio_tracks_packets[1].1)
+                    } else {
+                        Vec::new()
+                    };
+                    let discord_pcm = if mix.discord_enabled && mix.discord_gain > 0.001 {
+                        decode_aac_packets_via_mft(&demuxed.audio_tracks_packets[2].1)
+                    } else {
+                        Vec::new()
+                    };
+                    let mic_pcm = if mix.mic_enabled && mix.mic_gain > 0.001 {
+                        decode_aac_packets_via_mft(&demuxed.audio_tracks_packets[3].1)
+                    } else {
+                        Vec::new()
+                    };
+                    let other_pcm = if mix.other_enabled && mix.other_gain > 0.001 {
+                        decode_aac_packets_via_mft(&demuxed.audio_tracks_packets[4].1)
+                    } else {
+                        Vec::new()
+                    };
+                    let max_samples = game_pcm
+                        .len()
+                        .max(discord_pcm.len())
+                        .max(mic_pcm.len())
+                        .max(other_pcm.len());
+                    if max_samples >= 1024 {
+                        if let Some(mut enc) = crate::audio_engine::build_aac_encoder(128) {
+                            let silent_pkt = build_silent_aac_packet(128);
+                            let mut pcm_chunk = vec![0i16; 2048];
+                            let mut aac_buf = vec![0u8; 2048];
+                            let mut out = Vec::new();
+                            for (pkt_idx, p) in master_pkts.iter().enumerate() {
+                                if p.pts_ms.saturating_add(22) < start_ms {
+                                    continue;
+                                }
+                                if p.pts_ms > end_ms.saturating_add(40) {
+                                    break;
+                                }
+                                let base_sample = pkt_idx * 1024;
+                                for s_idx in 0..1024 {
+                                    let idx = base_sample + s_idx;
+                                    let (gl, gr) = game_pcm.get(idx).copied().unwrap_or((0.0, 0.0));
+                                    let (dl, dr) = discord_pcm.get(idx).copied().unwrap_or((0.0, 0.0));
+                                    let (ml, mr) = mic_pcm.get(idx).copied().unwrap_or((0.0, 0.0));
+                                    let (ol, or_) = other_pcm.get(idx).copied().unwrap_or((0.0, 0.0));
+                                    let l = (gl * mix.game_gain
+                                        + dl * mix.discord_gain
+                                        + ml * mix.mic_gain
+                                        + ol * mix.other_gain)
+                                        .clamp(-1.0, 1.0);
+                                    let r = (gr * mix.game_gain
+                                        + dr * mix.discord_gain
+                                        + mr * mix.mic_gain
+                                        + or_ * mix.other_gain)
+                                        .clamp(-1.0, 1.0);
+                                    pcm_chunk[s_idx * 2] = (l * 32767.0) as i16;
+                                    pcm_chunk[s_idx * 2 + 1] = (r * 32767.0) as i16;
+                                }
+                                let encoded_bytes = enc
+                                    .encode(&pcm_chunk, &mut aac_buf)
+                                    .ok()
+                                    .filter(|r| r.out_bytes() > 0)
+                                    .map(|r| Bytes::copy_from_slice(&aac_buf[..r.out_bytes()]))
+                                    .unwrap_or_else(|| silent_pkt.clone());
+                                let new_stems = if keep_stems {
+                                    p.stems.as_ref().map(|st| {
+                                        Arc::new(AudioStemPackets {
+                                            game: if mix.game_enabled { st.game.clone() } else { silent_pkt.clone() },
+                                            discord: if mix.discord_enabled { st.discord.clone() } else { silent_pkt.clone() },
+                                            mic: if mix.mic_enabled { st.mic.clone() } else { silent_pkt.clone() },
+                                            other: if mix.other_enabled { st.other.clone() } else { silent_pkt.clone() },
+                                        })
+                                    })
+                                } else {
+                                    None
+                                };
+                                out.push(Arc::new(CompressedPacket {
+                                    kind: PacketKind::Audio,
+                                    pts_ms: p.pts_ms,
+                                    pts: p.pts,
+                                    dts: p.dts,
+                                    duration: p.duration,
+                                    is_keyframe: true,
+                                    data: encoded_bytes,
+                                    stems: new_stems,
+                                }));
+                            }
+                            if !out.is_empty() {
+                                return (out, keep_stems);
+                            }
+                        }
+                    }
+                }
                 let master_pkts = &demuxed.audio_tracks_packets[0].1;
                 let silent_pkt = build_silent_aac_packet(128);
                 let mut out = Vec::new();
@@ -2198,7 +2714,14 @@ fn try_ffmpeg_edit_job(
     video_kbps: u32,
     temp_output: &Path,
 ) -> Result<String, String> {
+    let trim_off_keyframe = start_ms > 0
+        && !meta
+            .keyframe_timestamps_ms
+            .iter()
+            .any(|&kf| kf.abs_diff(start_ms) <= 150);
+
     let need_reencode_video = job.cut_mode == CutMode::FrameExact
+        || (job.cut_mode == CutMode::FastKeyframeCopy && trim_off_keyframe)
         || dst_w != meta.width
         || dst_h != meta.height
         || dst_fps != meta.fps
@@ -2600,7 +3123,14 @@ pub fn run_edit_job(job: EditJob) -> Result<EditResult, String> {
         }
     }
 
+    let trim_off_keyframe = start_ms > 0
+        && !meta
+            .keyframe_timestamps_ms
+            .iter()
+            .any(|&kf| kf.abs_diff(start_ms) <= 150);
+
     let need_reencode_video = job.cut_mode == CutMode::FrameExact
+        || (job.cut_mode == CutMode::FastKeyframeCopy && trim_off_keyframe)
         || dst_w != meta.width
         || dst_h != meta.height
         || dst_fps != meta.fps
@@ -2823,7 +3353,12 @@ pub fn split_multi_clip(
             .map(|e| if e.eq_ignore_ascii_case("mkv") { "mkv" } else { "mp4" })
             .unwrap_or("mp4");
         let part_path = parent.join(format!("{stem}_part{}.{ext}", idx + 1));
-        let res = cut_clip(&in_p, seg_start, seg_end, mode, Some(part_path))?;
+        let effective_mode = if mode == CutMode::KeyframeSnap {
+            CutMode::KeyframeSnap
+        } else {
+            CutMode::FrameExact
+        };
+        let res = cut_clip(&in_p, seg_start, seg_end, effective_mode, Some(part_path))?;
         parts.push(res);
     }
 
